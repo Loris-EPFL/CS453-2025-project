@@ -1,4 +1,4 @@
-#include <stdbool.h>
+#pragma once
 
 /** Define a proposition as likely true.
  * @param prop Proposition

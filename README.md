@@ -17,8 +17,8 @@ This repository provides:
 * examples of how to use synchronization primitives (in `sync-examples/`)
 * a reference implementation (in `reference/`)
 * a "skeleton" implementation (in `template/`)
-  * this template is written in C11
-  * feel free to overwrite it completely if you prefer to use C++ (in this case include `<tm.hpp>` instead of `<tm.h>`)
+  * this template is written in C++17
+  * it includes `<tm.hpp>` for the C++ interface
 * the program that will test your implementation (in `grading/`)
   * the same program will be used on the evaluation server (although possibly with a different seed)
   * you can use it to test/debug your implementation on your local machine (see the [description](https://dcl.epfl.ch/site/_media/education/ca-project.pdf))
