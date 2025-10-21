@@ -16,10 +16,8 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#include <tm.hpp>
 
-extern "C" {
-#include <tm.h>
-}
 #include "macros.h"
 
 // TL2 Constants
@@ -72,10 +70,20 @@ struct Region {
     void* start;
     size_t size;
     size_t align;
-    SegmentNode* allocs;
-    size_t num_locks;
+    std::atomic<uintptr_t> local_clock{1};
     VersionedLock* locks;
-    std::atomic<uintptr_t> local_clock{0}; // Per-region clock for better scalability
+    size_t num_locks;
+    SegmentNode* allocs{nullptr};
+    
+    ~Region() {
+        if (locks) delete[] locks;
+        SegmentNode* current = allocs;
+        while (current) {
+            SegmentNode* next = current->next;
+            std::free(current); // Correctly free SegmentNode allocated with posix_memalign
+            current = next;
+        }
+    }
 };
 
 // Map address to lock index using stripe-based locking
@@ -109,7 +117,7 @@ static bool validate_read_set(Transaction* tx, Region* region) {
     return true;
 }
 
-shared_t tm_create(size_t size, size_t align) {
+shared_t tm_create(size_t size, size_t align) noexcept {
     Region* region = new Region();
     if (unlikely(!region)) {
         return invalid_shared;
@@ -133,34 +141,27 @@ shared_t tm_create(size_t size, size_t align) {
     return region;
 }
 
-void tm_destroy(shared_t shared) {
+void tm_destroy(shared_t shared) noexcept {
     Region* region = (Region*)shared;
-    
-    // Free all allocated segments
-    while (region->allocs) {
-        SegmentNode* next = region->allocs->next;
-        free(region->allocs);
-        region->allocs = next;
-    }
     
     delete[] region->locks;
     free(region->start);
     delete region;
 }
 
-void* tm_start(shared_t shared) {
+void* tm_start(shared_t shared) noexcept {
     return ((Region*)shared)->start;
 }
 
-size_t tm_size(shared_t shared) {
+size_t tm_size(shared_t shared) noexcept {
     return ((Region*)shared)->size;
 }
 
-size_t tm_align(shared_t shared) {
+size_t tm_align(shared_t shared) noexcept {
     return ((Region*)shared)->align;
 }
 
-tx_t tm_begin(shared_t shared, bool is_ro) {
+tx_t tm_begin(shared_t shared, bool is_ro) noexcept {
     Region* region = (Region*)shared;
     Transaction* tx = new Transaction();
     if (unlikely(!tx)) {
@@ -228,7 +229,7 @@ static void unlock_write_set(Transaction* tx, Region* region) {
     tx->locked_indices.clear();
 }
 
-bool tm_end(shared_t shared, tx_t tx_id) {
+bool tm_end(shared_t shared, tx_t tx_id) noexcept {
     Transaction* tx = (Transaction*)tx_id;
     Region* region = (Region*)shared;
     
@@ -268,12 +269,25 @@ bool tm_end(shared_t shared, tx_t tx_id) {
         memcpy(entry.addr, entry.data.data(), entry.size);
     }
     
+    // Process allocations
+    for (void* addr : tx->alloc_set) {
+        SegmentNode* node = (SegmentNode*)((uintptr_t)addr - sizeof(SegmentNode));
+        node->prev = nullptr;
+        node->next = region->allocs;
+        if (region->allocs) region->allocs->prev = node;
+        region->allocs = node;
+    }
+
     // Process frees
     for (void* addr : tx->free_set) {
         SegmentNode* node = (SegmentNode*)((uintptr_t)addr - sizeof(SegmentNode));
-        if (node->prev) node->prev->next = node->next;
-        else region->allocs = node->next;
-        if (node->next) node->next->prev = node->prev;
+        // Only unlink if the node is actually in the region's allocation list
+        // This handles cases where memory was allocated and freed within the same transaction
+        if (node->prev || node->next || region->allocs == node) {
+            if (node->prev) node->prev->next = node->next;
+            else region->allocs = node->next;
+            if (node->next) node->next->prev = node->prev;
+        }
         free(node);
     }
     
@@ -286,7 +300,7 @@ bool tm_end(shared_t shared, tx_t tx_id) {
     return true;
 }
 
-bool tm_read(shared_t shared, tx_t tx_id, void const* source, size_t size, void* target) {
+bool tm_read(shared_t shared, tx_t tx_id, void const* source, size_t size, void* target) noexcept {
     Transaction* tx = (Transaction*)tx_id;
     Region* region = (Region*)shared;
     
@@ -345,7 +359,7 @@ bool tm_read(shared_t shared, tx_t tx_id, void const* source, size_t size, void*
     }
 }
 
-bool tm_write(shared_t shared, tx_t tx_id, void const* source, size_t size, void* target) {
+bool tm_write(shared_t shared, tx_t tx_id, void const* source, size_t size, void* target) noexcept {
     Transaction* tx = (Transaction*)tx_id;
     Region* region = (Region*)shared;
     
@@ -371,7 +385,7 @@ bool tm_write(shared_t shared, tx_t tx_id, void const* source, size_t size, void
     return true;
 }
 
-alloc_t tm_alloc(shared_t shared, tx_t tx_id, size_t size, void** target) {
+Alloc tm_alloc(shared_t shared, tx_t tx_id, size_t size, void** target) noexcept {
     Transaction* tx = (Transaction*)tx_id;
     Region* region = (Region*)shared;
     
@@ -382,14 +396,14 @@ alloc_t tm_alloc(shared_t shared, tx_t tx_id, size_t size, void** target) {
     
     SegmentNode* node;
     if (posix_memalign((void**)&node, align, sizeof(SegmentNode) + size) != 0) {
-        return nomem_alloc;
+        return Alloc::nomem;
     }
     
-    // Link into allocation list
-    node->prev = nullptr;
-    node->next = region->allocs;
-    if (node->next) node->next->prev = node;
-    region->allocs = node;
+    // Link into allocation list (this will be done in tm_end on commit)
+    // node->prev = nullptr;
+    // node->next = region->allocs;
+    // if (node->next) node->next->prev = node;
+    // region->allocs = node;
     
     void* segment = (void*)((uintptr_t)node + sizeof(SegmentNode));
     memset(segment, 0, size);
@@ -397,21 +411,19 @@ alloc_t tm_alloc(shared_t shared, tx_t tx_id, size_t size, void** target) {
     
     tx->alloc_set.insert(segment);
     
-    return success_alloc;
+    return Alloc::success;
 }
 
-bool tm_free(shared_t shared, tx_t tx_id, void* target) {
+bool tm_free(shared_t shared, tx_t tx_id, void* target) noexcept {
     Transaction* tx = (Transaction*)tx_id;
     Region* region = (Region*)shared;
+    (void)region; // Suppress unused variable warning
     
     // Check if allocated in this transaction
     if (tx->alloc_set.count(target)) {
         // Remove from alloc set and free immediately
         tx->alloc_set.erase(target);
         SegmentNode* node = (SegmentNode*)((uintptr_t)target - sizeof(SegmentNode));
-        if (node->prev) node->prev->next = node->next;
-        else region->allocs = node->next;
-        if (node->next) node->next->prev = node->prev;
         free(node);
         return true;
     }
