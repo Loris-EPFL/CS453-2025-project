@@ -5,65 +5,59 @@
  * @section DESCRIPTION
  *
  * Transactional Locking II (TL2) implementation for CS453 project.
- * This implementation follows the TL2 algorithm with global version clock,
- * versioned write-locks, and commit-time locking.
+ * This implementation strictly follows the TL2 algorithm specification
+ * with proper global version clock, versioned locks, and 5-phase commit.
 **/
 
 #include <algorithm>
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
-#include <unordered_map>
+#include <map>
 #include <unordered_set>
 #include <vector>
 #include <tm.hpp>
 
 #include "macros.h"
 
-// TL2 Constants
+// TL2 Constants - using MSB as lock bit
 static constexpr uintptr_t LOCK_BIT = 1UL << 63;
 static constexpr uintptr_t VERSION_MASK = ~LOCK_BIT;
 
-// Versioned lock structure
+// Versioned lock structure (per TL2 spec)
 struct VersionedLock {
-    std::atomic<uintptr_t> value{0}; // MSB: lock bit, rest: version number
+    std::atomic<uintptr_t> value{2}; // Initialize to even number (version 2)
 };
 
-// Global version clock (one per shared memory region would be better, but using global for simplicity)
-static std::atomic<uintptr_t> global_clock{0};
-
-// Read set entry
+// Read set entry (Lock_Pointer, Version_Observed)
 struct ReadEntry {
-    void* addr;
-    size_t lock_idx;
-    uintptr_t version;
+    VersionedLock* lock_ptr;
+    uintptr_t version_observed;
 };
 
-// Write set entry
+// Write set entry - using map for sorted order
 struct WriteEntry {
     void* addr;
     size_t size;
     std::vector<uint8_t> data;
-    size_t lock_idx;
 };
 
 // Allocated segment metadata
 struct SegmentNode {
     SegmentNode* prev;
     SegmentNode* next;
-    std::atomic<bool> freed{false}; // Atomic flag to prevent double-free
 };
 
-// Transaction descriptor
+// Transaction descriptor (per TL2 spec)
 struct Transaction {
-    uintptr_t rv;  // Read version number
-    uintptr_t wv;  // Write version number
-    bool is_ro;    // Read-only transaction flag
-    std::vector<ReadEntry> read_set;
-    std::vector<WriteEntry> write_set;
+    uintptr_t rv;  // ReadVersion - snapshot from GVClock
+    uintptr_t wv;  // WriteVersion - assigned at commit time
+    bool is_ro;    // IsReadOnly flag
+    std::vector<ReadEntry> read_set;  // Only for read-write transactions
+    std::map<void*, WriteEntry> write_set;  // Sorted map for deadlock-free locking
+    std::vector<VersionedLock*> acquired_locks;  // Locks held during commit
     std::unordered_set<void*> alloc_set;
     std::unordered_set<void*> free_set;
-    std::unordered_set<size_t> locked_indices;
 };
 
 // Shared memory region
@@ -71,20 +65,14 @@ struct Region {
     void* start;
     size_t size;
     size_t align;
-    std::atomic<uintptr_t> local_clock{1};
+    std::atomic<uintptr_t> gv_clock{2};  // Global Version Clock - starts at even number
     VersionedLock* locks;
     size_t num_locks;
     SegmentNode* allocs{nullptr};
-    
-    ~Region() {
-        // No need to clean up allocs here since tm_destroy handles it
-        // This prevents double-free race conditions
-    }
 };
 
 // Map address to lock index using stripe-based locking
 static inline size_t addr_to_lock_index(Region* region, void const* addr) {
-    // For addresses outside the shared region, use a hash-based approach
     uintptr_t addr_val = (uintptr_t)addr;
     uintptr_t region_start = (uintptr_t)region->start;
     
@@ -97,30 +85,6 @@ static inline size_t addr_to_lock_index(Region* region, void const* addr) {
         // Address outside shared region (dynamically allocated) - use hash
         return (addr_val / sizeof(void*)) % region->num_locks;
     }
-}
-
-// Validate read set
-static bool validate_read_set(Transaction* tx, Region* region) {
-    for (const auto& entry : tx->read_set) {
-        // Skip validation for locks we hold
-        if (tx->locked_indices.find(entry.lock_idx) != tx->locked_indices.end()) {
-            continue;
-        }
-        
-        uintptr_t lock_val = region->locks[entry.lock_idx].value.load(std::memory_order_acquire);
-        
-        // Check if locked by another transaction
-        if ((lock_val & LOCK_BIT) != 0) {
-            return false;
-        }
-        
-        // Check if version changed
-        uintptr_t version = lock_val & VERSION_MASK;
-        if (version != entry.version) {
-            return false;
-        }
-    }
-    return true;
 }
 
 shared_t tm_create(size_t size, size_t align) noexcept {
@@ -139,7 +103,6 @@ shared_t tm_create(size_t size, size_t align) noexcept {
     region->allocs = nullptr;
     
     // Create lock table (stripe-based)
-    // Use a fixed modest size that scales well for all memory sizes
     size_t desired_locks = std::min(size / 1024, (size_t)(1UL << 16));
     region->num_locks = std::max(desired_locks, (size_t)256);
     region->locks = new VersionedLock[region->num_locks]();
@@ -150,19 +113,13 @@ shared_t tm_create(size_t size, size_t align) noexcept {
 void tm_destroy(shared_t shared) noexcept {
     Region* region = (Region*)shared;
     
-    // Clean up allocated segments before destroying region
-    // This prevents race condition with Region destructor
+    // Clean up allocated segments
     SegmentNode* current = region->allocs;
     while (current) {
         SegmentNode* next = current->next;
-        // Use atomic flag to prevent double-free
-        bool expected = false;
-        if (current->freed.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
-            std::free(current);
-        }
+        std::free(current);
         current = next;
     }
-    region->allocs = nullptr; // Clear the list
     
     delete[] region->locks;
     free(region->start);
@@ -181,6 +138,7 @@ size_t tm_align(shared_t shared) noexcept {
     return ((Region*)shared)->align;
 }
 
+// TransactionBegin procedure (per TL2 spec)
 tx_t tm_begin(shared_t shared, bool is_ro) noexcept {
     Region* region = (Region*)shared;
     Transaction* tx = new Transaction();
@@ -188,221 +146,229 @@ tx_t tm_begin(shared_t shared, bool is_ro) noexcept {
         return invalid_tx;
     }
     
+    // Set IsReadOnly flag
     tx->is_ro = is_ro;
-    // Sample global version clock
-    tx->rv = region->local_clock.load(std::memory_order_acquire);
-    tx->wv = 0;
+    
+    // Atomically load GVClock and store in ReadVersion
+    tx->rv = region->gv_clock.load(std::memory_order_acquire);
+    
+    tx->wv = 0;  // Will be set at commit time
     
     return (tx_t)tx;
 }
 
-// Lock write set in sorted order to avoid deadlock
-static bool lock_write_set(Transaction* tx, Region* region) {
-    // Collect unique lock indices
-    std::vector<size_t> indices;
-    for (const auto& entry : tx->write_set) {
-        indices.push_back(entry.lock_idx);
-    }
-    
-    // Sort and remove duplicates
-    std::sort(indices.begin(), indices.end());
-    indices.erase(std::unique(indices.begin(), indices.end()), indices.end());
-    
-    // Try to acquire locks in order
-    for (size_t idx : indices) {
-        if (tx->locked_indices.count(idx)) {
-            continue; // Already locked
-        }
-        
-        uintptr_t expected = region->locks[idx].value.load(std::memory_order_acquire);
-        while (true) {
-            // Check if locked
-            if (expected & LOCK_BIT) {
-                return false;
-            }
-            
-            // Check if version is too new
-            if ((expected & VERSION_MASK) > tx->rv) {
-                return false;
-            }
-            
-            // Try to acquire lock
-            uintptr_t desired = expected | LOCK_BIT;
-            if (region->locks[idx].value.compare_exchange_weak(
-                    expected, desired,
-                    std::memory_order_acquire,
-                    std::memory_order_acquire)) {
-                tx->locked_indices.insert(idx);
-                break;
-            }
-        }
-    }
-    return true;
-}
-
-// Release all locks held by transaction
-static void unlock_write_set(Transaction* tx, Region* region) {
-    for (size_t idx : tx->locked_indices) {
-        uintptr_t lock_val = region->locks[idx].value.load(std::memory_order_relaxed);
-        region->locks[idx].value.store(lock_val & VERSION_MASK, std::memory_order_release);
-    }
-    tx->locked_indices.clear();
-}
-
-bool tm_end(shared_t shared, tx_t tx_id) noexcept {
-    Transaction* tx = (Transaction*)tx_id;
-    Region* region = (Region*)shared;
-    
-    // Read-only transaction: just validate and commit
-    if (tx->is_ro) {
-        bool valid = validate_read_set(tx, region);
-        delete tx;
-        return valid;
-    }
-    
-    // Empty write set: validate and commit
-    if (tx->write_set.empty() && tx->alloc_set.empty() && tx->free_set.empty()) {
-        bool valid = validate_read_set(tx, region);
-        delete tx;
-        return valid;
-    }
-    
-    // Lock write set
-    if (!lock_write_set(tx, region)) {
-        unlock_write_set(tx, region);
-        delete tx;
-        return false;
-    }
-    
-    // Increment global clock
-    tx->wv = region->local_clock.fetch_add(1, std::memory_order_acq_rel) + 1;
-    
-    // Validate read set
-    if (!validate_read_set(tx, region)) {
-        unlock_write_set(tx, region);
-        delete tx;
-        return false;
-    }
-    
-    // Commit writes
-    for (const auto& entry : tx->write_set) {
-        memcpy(entry.addr, entry.data.data(), entry.size);
-    }
-    
-    // Process allocations
-    for (void* addr : tx->alloc_set) {
-        SegmentNode* node = (SegmentNode*)((uintptr_t)addr - sizeof(SegmentNode));
-        node->freed.store(false, std::memory_order_relaxed); // Initialize freed flag
-        node->prev = nullptr;
-        node->next = region->allocs;
-        if (region->allocs) region->allocs->prev = node;
-        region->allocs = node;
-    }
-
-    // Process frees
-    for (void* addr : tx->free_set) {
-        SegmentNode* node = (SegmentNode*)((uintptr_t)addr - sizeof(SegmentNode));
-        
-        // Use atomic compare-and-swap to prevent double-free
-        bool expected = false;
-        if (!node->freed.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
-            // Already freed by another transaction, skip
-            continue;
-        }
-        
-        // Only unlink if the node is actually in the region's allocation list
-        // This handles cases where memory was allocated and freed within the same transaction
-        if (node->prev || node->next || region->allocs == node) {
-            if (node->prev) node->prev->next = node->next;
-            else region->allocs = node->next;
-            if (node->next) node->next->prev = node->prev;
-        }
-        free(node);
-    }
-    
-    // Release locks with new version
-    for (size_t idx : tx->locked_indices) {
-        region->locks[idx].value.store(tx->wv, std::memory_order_release);
-    }
-    
-    delete tx;
-    return true;
-}
-
+// TransactionalRead procedure (per TL2 spec)
 bool tm_read(shared_t shared, tx_t tx_id, void const* source, size_t size, void* target) noexcept {
     Transaction* tx = (Transaction*)tx_id;
     Region* region = (Region*)shared;
     
-    // Check write set for read-after-write
+    // Step 1: Check Write-Set for read-your-own-writes
+    auto it = tx->write_set.find((void*)source);
+    if (it != tx->write_set.end() && it->second.size == size) {
+        // Found exact match in WriteSet
+        memcpy(target, it->second.data.data(), size);
+        return true;
+    }
+    
+    // Check for partial overlaps in WriteSet (abort for safety)
     uintptr_t read_start = (uintptr_t)source;
     uintptr_t read_end = read_start + size;
     
     for (const auto& entry : tx->write_set) {
-        uintptr_t write_start = (uintptr_t)entry.addr;
-        uintptr_t write_end = write_start + entry.size;
+        uintptr_t write_start = (uintptr_t)entry.first;
+        uintptr_t write_end = write_start + entry.second.size;
         
-        // Check for overlap
+        // Check for any overlap
         if (read_start < write_end && write_start < read_end) {
-            // Exact match
-            if (read_start == write_start && size == entry.size) {
-                memcpy(target, entry.data.data(), size);
-                return true;
-            }
-            // Partial overlap - abort for safety
-            return false;
+            return false; // Abort on partial overlap
         }
     }
     
-    // Read from shared memory with version validation
+    // Step 2: Read from Shared Memory
     size_t lock_idx = addr_to_lock_index(region, source);
+    VersionedLock* lock_ptr = &region->locks[lock_idx];
     
     while (true) {
-        uintptr_t lock_val_before = region->locks[lock_idx].value.load(std::memory_order_acquire);
+        // Atomically load lock value into v1
+        uintptr_t v1 = lock_ptr->value.load(std::memory_order_acquire);
         
-        // Wait if locked
-        if ((lock_val_before & LOCK_BIT) != 0) {
+        // Step 3: Pre-Validation Rule
+        // Check if lock bit is set OR version > ReadVersion
+        if ((v1 & LOCK_BIT) != 0 || (v1 & VERSION_MASK) > tx->rv) {
+            return false; // Abort transaction
+        }
+        
+        // Step 4: Perform Read
+        memcpy(target, source, size);
+        
+        // Step 5: Post-Validation Rule
+        // Atomically load lock value again into v2
+        uintptr_t v2 = lock_ptr->value.load(std::memory_order_acquire);
+        
+        if (v1 != v2) {
+            // Concurrent modification occurred, retry
             continue;
         }
         
-        // Perform the read
-        memcpy(target, source, size);
-        
-        // Validate version didn't change
-        uintptr_t lock_val_after = region->locks[lock_idx].value.load(std::memory_order_acquire);
-        
-        if (lock_val_before == lock_val_after) {
-            uintptr_t version = lock_val_after & VERSION_MASK;
-            
-            // Check version against read version
-            if (version > tx->rv) {
-                return false; // Abort
-            }
-            
-            // Add to read set (if not read-only or small transaction)
-            if (!tx->is_ro) {
-                tx->read_set.push_back({(void*)source, lock_idx, version});
-            }
-            
-            return true;
+        // Step 6: Record Read (for Read-Write Transactions only)
+        if (!tx->is_ro) {
+            ReadEntry entry;
+            entry.lock_ptr = lock_ptr;
+            entry.version_observed = v1 & VERSION_MASK;
+            tx->read_set.push_back(entry);
         }
+        
+        return true;
     }
 }
 
+// TransactionalWrite procedure (per TL2 spec)
 bool tm_write(shared_t shared, tx_t tx_id, void const* source, size_t size, void* target) noexcept {
     Transaction* tx = (Transaction*)tx_id;
-    Region* region = (Region*)shared;
     
-    size_t lock_idx = addr_to_lock_index(region, target);
+    // Check if read-only transaction
+    if (tx->is_ro) {
+        return false; // Abort read-only transaction
+    }
     
-    // Store in write set
+    // Insert or update in WriteSet
     WriteEntry entry;
     entry.addr = target;
     entry.size = size;
     entry.data.resize(size);
     memcpy(entry.data.data(), source, size);
-    entry.lock_idx = lock_idx;
     
-    tx->write_set.push_back(entry);
+    tx->write_set[target] = entry;
+    return true;
+}
+
+// ABORT_PROCEDURE helper
+static void abort_transaction(Transaction* tx, Region* region) {
+    // Release any acquired locks, leaving version unchanged
+    for (VersionedLock* lock_ptr : tx->acquired_locks) {
+        uintptr_t current = lock_ptr->value.load(std::memory_order_relaxed);
+        lock_ptr->value.store(current & VERSION_MASK, std::memory_order_release);
+    }
+    tx->acquired_locks.clear();
+    delete tx;
+}
+
+// TransactionEnd procedure - 5-phase commit protocol (per TL2 spec)
+bool tm_end(shared_t shared, tx_t tx_id) noexcept {
+    Transaction* tx = (Transaction*)tx_id;
+    Region* region = (Region*)shared;
+    
+    // Step 1: Handle Trivial Cases
+    if (tx->is_ro || (tx->write_set.empty() && tx->alloc_set.empty() && tx->free_set.empty())) {
+        // For read-only or empty transactions, just validate read set
+        for (const auto& entry : tx->read_set) {
+            uintptr_t current = entry.lock_ptr->value.load(std::memory_order_acquire);
+            if ((current & VERSION_MASK) != entry.version_observed || (current & LOCK_BIT) != 0) {
+                delete tx;
+                return false;
+            }
+        }
+        delete tx;
+        return true;
+    }
+    
+    // Step 2: Phase 1 - Lock Acquisition
+    // WriteSet is already sorted (std::map), iterate in order for deadlock-free locking
+    for (const auto& entry : tx->write_set) {
+        size_t lock_idx = addr_to_lock_index(region, entry.first);
+        VersionedLock* lock_ptr = &region->locks[lock_idx];
+        
+        // Skip if already acquired
+        bool already_acquired = false;
+        for (VersionedLock* acquired : tx->acquired_locks) {
+            if (acquired == lock_ptr) {
+                already_acquired = true;
+                break;
+            }
+        }
+        if (already_acquired) continue;
+        
+        // Attempt to acquire lock with CAS
+        uintptr_t expected = lock_ptr->value.load(std::memory_order_acquire);
+        while (true) {
+            // Check if locked or version too new
+            if ((expected & LOCK_BIT) != 0 || (expected & VERSION_MASK) > tx->rv) {
+                abort_transaction(tx, region);
+                return false;
+            }
+            
+            // Try to set lock bit
+            uintptr_t desired = expected | LOCK_BIT;
+            if (lock_ptr->value.compare_exchange_weak(expected, desired, 
+                    std::memory_order_acquire, std::memory_order_acquire)) {
+                tx->acquired_locks.push_back(lock_ptr);
+                break;
+            }
+        }
+    }
+    
+    // Step 3: Phase 2 - Timestamping
+    // Atomically fetch-and-add GVClock by 2, store pre-increment value
+    tx->wv = region->gv_clock.fetch_add(2, std::memory_order_acq_rel);
+    
+    // Step 4: Phase 3 - Read-Set Validation
+    for (const auto& entry : tx->read_set) {
+        uintptr_t current = entry.lock_ptr->value.load(std::memory_order_acquire);
+        
+        // Check if version changed or locked by different transaction
+        bool locked_by_us = false;
+        for (VersionedLock* acquired : tx->acquired_locks) {
+            if (acquired == entry.lock_ptr) {
+                locked_by_us = true;
+                break;
+            }
+        }
+        
+        if (!locked_by_us) {
+            if ((current & LOCK_BIT) != 0 || (current & VERSION_MASK) != entry.version_observed) {
+                abort_transaction(tx, region);
+                return false;
+            }
+        }
+    }
+    
+    // Step 5: Phase 4 - Commit (Point of No Return)
+    // Copy WriteSet data to shared memory
+    for (const auto& entry : tx->write_set) {
+        memcpy(entry.first, entry.second.data.data(), entry.second.size);
+    }
+    
+    // Process allocations
+    for (void* addr : tx->alloc_set) {
+        SegmentNode* node = (SegmentNode*)((uintptr_t)addr - sizeof(SegmentNode));
+        node->prev = nullptr;
+        node->next = region->allocs;
+        if (region->allocs) region->allocs->prev = node;
+        region->allocs = node;
+    }
+    
+    // Process frees
+    for (void* addr : tx->free_set) {
+        SegmentNode* node = (SegmentNode*)((uintptr_t)addr - sizeof(SegmentNode));
+        
+        // Unlink from allocation list
+        if (node->prev) node->prev->next = node->next;
+        else region->allocs = node->next;
+        if (node->next) node->next->prev = node->prev;
+        
+        free(node);
+    }
+    
+    // Step 6: Phase 5 - Release Locks
+    // Calculate new version: WriteVersion + 2
+    uintptr_t new_version = tx->wv + 2;
+    
+    // Release all acquired locks with new version
+    for (VersionedLock* lock_ptr : tx->acquired_locks) {
+        lock_ptr->value.store(new_version, std::memory_order_release);
+    }
+    
+    delete tx;
     return true;
 }
 
@@ -420,20 +386,10 @@ Alloc tm_alloc(shared_t shared, tx_t tx_id, size_t size, void** target) noexcept
         return Alloc::nomem;
     }
     
-    // Link into allocation list (this will be done in tm_end on commit)
-    // node->prev = nullptr;
-    // node->next = region->allocs;
-    // if (node->next) node->next->prev = node;
-    // region->allocs = node;
-    
     void* segment = (void*)((uintptr_t)node + sizeof(SegmentNode));
     memset(segment, 0, size);
     
-    // Initialize the freed flag
-    node->freed.store(false, std::memory_order_relaxed);
-    
     *target = segment;
-    
     tx->alloc_set.insert(segment);
     
     return Alloc::success;
@@ -441,8 +397,6 @@ Alloc tm_alloc(shared_t shared, tx_t tx_id, size_t size, void** target) noexcept
 
 bool tm_free(shared_t shared, tx_t tx_id, void* target) noexcept {
     Transaction* tx = (Transaction*)tx_id;
-    Region* region = (Region*)shared;
-    (void)region; // Suppress unused variable warning
     
     // Check if allocated in this transaction
     if (tx->alloc_set.count(target)) {
