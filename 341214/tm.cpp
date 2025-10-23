@@ -51,6 +51,7 @@ struct WriteEntry {
 struct SegmentNode {
     SegmentNode* prev;
     SegmentNode* next;
+    std::atomic<bool> freed{false}; // Atomic flag to prevent double-free
 };
 
 // Transaction descriptor
@@ -76,13 +77,8 @@ struct Region {
     SegmentNode* allocs{nullptr};
     
     ~Region() {
-        if (locks) delete[] locks;
-        SegmentNode* current = allocs;
-        while (current) {
-            SegmentNode* next = current->next;
-            std::free(current); // Correctly free SegmentNode allocated with posix_memalign
-            current = next;
-        }
+        // No need to clean up allocs here since tm_destroy handles it
+        // This prevents double-free race conditions
     }
 };
 
@@ -143,6 +139,20 @@ shared_t tm_create(size_t size, size_t align) noexcept {
 
 void tm_destroy(shared_t shared) noexcept {
     Region* region = (Region*)shared;
+    
+    // Clean up allocated segments before destroying region
+    // This prevents race condition with Region destructor
+    SegmentNode* current = region->allocs;
+    while (current) {
+        SegmentNode* next = current->next;
+        // Use atomic flag to prevent double-free
+        bool expected = false;
+        if (current->freed.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+            std::free(current);
+        }
+        current = next;
+    }
+    region->allocs = nullptr; // Clear the list
     
     delete[] region->locks;
     free(region->start);
@@ -272,6 +282,7 @@ bool tm_end(shared_t shared, tx_t tx_id) noexcept {
     // Process allocations
     for (void* addr : tx->alloc_set) {
         SegmentNode* node = (SegmentNode*)((uintptr_t)addr - sizeof(SegmentNode));
+        node->freed.store(false, std::memory_order_relaxed); // Initialize freed flag
         node->prev = nullptr;
         node->next = region->allocs;
         if (region->allocs) region->allocs->prev = node;
@@ -281,6 +292,14 @@ bool tm_end(shared_t shared, tx_t tx_id) noexcept {
     // Process frees
     for (void* addr : tx->free_set) {
         SegmentNode* node = (SegmentNode*)((uintptr_t)addr - sizeof(SegmentNode));
+        
+        // Use atomic compare-and-swap to prevent double-free
+        bool expected = false;
+        if (!node->freed.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+            // Already freed by another transaction, skip
+            continue;
+        }
+        
         // Only unlink if the node is actually in the region's allocation list
         // This handles cases where memory was allocated and freed within the same transaction
         if (node->prev || node->next || region->allocs == node) {
@@ -407,6 +426,10 @@ Alloc tm_alloc(shared_t shared, tx_t tx_id, size_t size, void** target) noexcept
     
     void* segment = (void*)((uintptr_t)node + sizeof(SegmentNode));
     memset(segment, 0, size);
+    
+    // Initialize the freed flag
+    node->freed.store(false, std::memory_order_relaxed);
+    
     *target = segment;
     
     tx->alloc_set.insert(segment);
