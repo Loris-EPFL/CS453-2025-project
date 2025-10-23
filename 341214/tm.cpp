@@ -158,13 +158,13 @@ tx_t tm_begin(shared_t shared, bool is_ro) noexcept {
 }
 
 // TransactionalRead procedure (per TL2 spec)
-bool tm_read(shared_t shared, tx_t tx_id, void const* source, size_t size, void* target) noexcept {
-    Transaction* tx = (Transaction*)tx_id;
+bool tm_read(shared_t shared, tx_t tx, void const* source, size_t size, void* target) noexcept {
+    Transaction* tx_ptr = (Transaction*)tx;
     Region* region = (Region*)shared;
     
     // Step 1: Check Write-Set for read-your-own-writes
-    auto it = tx->write_set.find((void*)source);
-    if (it != tx->write_set.end() && it->second.size == size) {
+    auto it = tx_ptr->write_set.find((void*)source);
+    if (it != tx_ptr->write_set.end() && it->second.size == size) {
         // Found exact match in WriteSet
         memcpy(target, it->second.data.data(), size);
         return true;
@@ -174,7 +174,7 @@ bool tm_read(shared_t shared, tx_t tx_id, void const* source, size_t size, void*
     uintptr_t read_start = (uintptr_t)source;
     uintptr_t read_end = read_start + size;
     
-    for (const auto& entry : tx->write_set) {
+    for (const auto& entry : tx_ptr->write_set) {
         uintptr_t write_start = (uintptr_t)entry.first;
         uintptr_t write_end = write_start + entry.second.size;
         
@@ -194,7 +194,7 @@ bool tm_read(shared_t shared, tx_t tx_id, void const* source, size_t size, void*
         
         // Step 3: Pre-Validation Rule
         // Check if lock bit is set OR version > ReadVersion
-        if ((v1 & LOCK_BIT) != 0 || (v1 & VERSION_MASK) > tx->rv) {
+        if ((v1 & LOCK_BIT) != 0 || (v1 & VERSION_MASK) > tx_ptr->rv) {
             return false; // Abort transaction
         }
         
@@ -211,11 +211,11 @@ bool tm_read(shared_t shared, tx_t tx_id, void const* source, size_t size, void*
         }
         
         // Step 6: Record Read (for Read-Write Transactions only)
-        if (!tx->is_ro) {
+        if (!tx_ptr->is_ro) {
             ReadEntry entry;
             entry.lock_ptr = lock_ptr;
             entry.version_observed = v1 & VERSION_MASK;
-            tx->read_set.push_back(entry);
+            tx_ptr->read_set.push_back(entry);
         }
         
         return true;
@@ -223,22 +223,23 @@ bool tm_read(shared_t shared, tx_t tx_id, void const* source, size_t size, void*
 }
 
 // TransactionalWrite procedure (per TL2 spec)
-bool tm_write(shared_t shared, tx_t tx_id, void const* source, size_t size, void* target) noexcept {
-    Transaction* tx = (Transaction*)tx_id;
+bool tm_write(shared_t shared, tx_t tx, void const* source, size_t size, void* target) noexcept {
+    Transaction* tx_ptr = (Transaction*)tx;
+    Region* region = (Region*)shared;
     
-    // Check if read-only transaction
-    if (tx->is_ro) {
-        return false; // Abort read-only transaction
+    // Read-only transactions cannot write
+    if (tx_ptr->is_ro) {
+        return false;
     }
     
-    // Insert or update in WriteSet
+    // Store in write set for deferred execution
     WriteEntry entry;
     entry.addr = target;
     entry.size = size;
     entry.data.resize(size);
     memcpy(entry.data.data(), source, size);
     
-    tx->write_set[target] = entry;
+    tx_ptr->write_set[target] = std::move(entry);
     return true;
 }
 
@@ -254,33 +255,33 @@ static void abort_transaction(Transaction* tx, Region* region) {
 }
 
 // TransactionEnd procedure - 5-phase commit protocol (per TL2 spec)
-bool tm_end(shared_t shared, tx_t tx_id) noexcept {
-    Transaction* tx = (Transaction*)tx_id;
+bool tm_end(shared_t shared, tx_t tx) noexcept {
+    Transaction* tx_ptr = (Transaction*)tx;
     Region* region = (Region*)shared;
     
     // Step 1: Handle Trivial Cases
-    if (tx->is_ro || (tx->write_set.empty() && tx->alloc_set.empty() && tx->free_set.empty())) {
+    if (tx_ptr->is_ro || (tx_ptr->write_set.empty() && tx_ptr->alloc_set.empty() && tx_ptr->free_set.empty())) {
         // For read-only or empty transactions, just validate read set
-        for (const auto& entry : tx->read_set) {
+        for (const auto& entry : tx_ptr->read_set) {
             uintptr_t current = entry.lock_ptr->value.load(std::memory_order_acquire);
             if ((current & VERSION_MASK) != entry.version_observed || (current & LOCK_BIT) != 0) {
-                delete tx;
+                delete tx_ptr;
                 return false;
             }
         }
-        delete tx;
+        delete tx_ptr;
         return true;
     }
     
     // Step 2: Phase 1 - Lock Acquisition
     // WriteSet is already sorted (std::map), iterate in order for deadlock-free locking
-    for (const auto& entry : tx->write_set) {
+    for (const auto& entry : tx_ptr->write_set) {
         size_t lock_idx = addr_to_lock_index(region, entry.first);
         VersionedLock* lock_ptr = &region->locks[lock_idx];
         
         // Skip if already acquired
         bool already_acquired = false;
-        for (VersionedLock* acquired : tx->acquired_locks) {
+        for (VersionedLock* acquired : tx_ptr->acquired_locks) {
             if (acquired == lock_ptr) {
                 already_acquired = true;
                 break;
@@ -292,8 +293,8 @@ bool tm_end(shared_t shared, tx_t tx_id) noexcept {
         uintptr_t expected = lock_ptr->value.load(std::memory_order_acquire);
         while (true) {
             // Check if locked or version too new
-            if ((expected & LOCK_BIT) != 0 || (expected & VERSION_MASK) > tx->rv) {
-                abort_transaction(tx, region);
+            if ((expected & LOCK_BIT) != 0 || (expected & VERSION_MASK) > tx_ptr->rv) {
+                abort_transaction(tx_ptr, region);
                 return false;
             }
             
@@ -301,7 +302,7 @@ bool tm_end(shared_t shared, tx_t tx_id) noexcept {
             uintptr_t desired = expected | LOCK_BIT;
             if (lock_ptr->value.compare_exchange_weak(expected, desired, 
                     std::memory_order_acquire, std::memory_order_acquire)) {
-                tx->acquired_locks.push_back(lock_ptr);
+                tx_ptr->acquired_locks.push_back(lock_ptr);
                 break;
             }
         }
@@ -309,15 +310,15 @@ bool tm_end(shared_t shared, tx_t tx_id) noexcept {
     
     // Step 3: Phase 2 - Timestamping
     // Atomically fetch-and-add GVClock by 2, store pre-increment value
-    tx->wv = region->gv_clock.fetch_add(2, std::memory_order_acq_rel);
+    tx_ptr->wv = region->gv_clock.fetch_add(2, std::memory_order_acq_rel);
     
     // Step 4: Phase 3 - Read-Set Validation
-    for (const auto& entry : tx->read_set) {
+    for (const auto& entry : tx_ptr->read_set) {
         uintptr_t current = entry.lock_ptr->value.load(std::memory_order_acquire);
         
         // Check if version changed or locked by different transaction
         bool locked_by_us = false;
-        for (VersionedLock* acquired : tx->acquired_locks) {
+        for (VersionedLock* acquired : tx_ptr->acquired_locks) {
             if (acquired == entry.lock_ptr) {
                 locked_by_us = true;
                 break;
@@ -326,7 +327,7 @@ bool tm_end(shared_t shared, tx_t tx_id) noexcept {
         
         if (!locked_by_us) {
             if ((current & LOCK_BIT) != 0 || (current & VERSION_MASK) != entry.version_observed) {
-                abort_transaction(tx, region);
+                abort_transaction(tx_ptr, region);
                 return false;
             }
         }
@@ -334,12 +335,12 @@ bool tm_end(shared_t shared, tx_t tx_id) noexcept {
     
     // Step 5: Phase 4 - Commit (Point of No Return)
     // Copy WriteSet data to shared memory
-    for (const auto& entry : tx->write_set) {
+    for (const auto& entry : tx_ptr->write_set) {
         memcpy(entry.first, entry.second.data.data(), entry.second.size);
     }
     
     // Process allocations
-    for (void* addr : tx->alloc_set) {
+    for (void* addr : tx_ptr->alloc_set) {
         SegmentNode* node = (SegmentNode*)((uintptr_t)addr - sizeof(SegmentNode));
         node->prev = nullptr;
         node->next = region->allocs;
@@ -348,7 +349,7 @@ bool tm_end(shared_t shared, tx_t tx_id) noexcept {
     }
     
     // Process frees
-    for (void* addr : tx->free_set) {
+    for (void* addr : tx_ptr->free_set) {
         SegmentNode* node = (SegmentNode*)((uintptr_t)addr - sizeof(SegmentNode));
         
         // Unlink from allocation list
@@ -361,19 +362,19 @@ bool tm_end(shared_t shared, tx_t tx_id) noexcept {
     
     // Step 6: Phase 5 - Release Locks
     // Calculate new version: WriteVersion + 2
-    uintptr_t new_version = tx->wv + 2;
+    uintptr_t new_version = tx_ptr->wv + 2;
     
     // Release all acquired locks with new version
-    for (VersionedLock* lock_ptr : tx->acquired_locks) {
+    for (VersionedLock* lock_ptr : tx_ptr->acquired_locks) {
         lock_ptr->value.store(new_version, std::memory_order_release);
     }
     
-    delete tx;
+    delete tx_ptr;
     return true;
 }
 
-Alloc tm_alloc(shared_t shared, tx_t tx_id, size_t size, void** target) noexcept {
-    Transaction* tx = (Transaction*)tx_id;
+Alloc tm_alloc(shared_t shared, tx_t tx, size_t size, void** target) noexcept {
+    Transaction* tx_ptr = (Transaction*)tx;
     Region* region = (Region*)shared;
     
     size_t align = region->align;
@@ -390,24 +391,25 @@ Alloc tm_alloc(shared_t shared, tx_t tx_id, size_t size, void** target) noexcept
     memset(segment, 0, size);
     
     *target = segment;
-    tx->alloc_set.insert(segment);
+    tx_ptr->alloc_set.insert(segment);
     
     return Alloc::success;
 }
 
-bool tm_free(shared_t shared, tx_t tx_id, void* target) noexcept {
-    Transaction* tx = (Transaction*)tx_id;
+bool tm_free(shared_t shared, tx_t tx, void* target) noexcept {
+    Transaction* tx_ptr = (Transaction*)tx;
+    Region* region = (Region*)shared;
     
     // Check if allocated in this transaction
-    if (tx->alloc_set.count(target)) {
+    if (tx_ptr->alloc_set.count(target)) {
         // Remove from alloc set and free immediately
-        tx->alloc_set.erase(target);
+        tx_ptr->alloc_set.erase(target);
         SegmentNode* node = (SegmentNode*)((uintptr_t)target - sizeof(SegmentNode));
         free(node);
         return true;
     }
     
     // Defer free until commit
-    tx->free_set.insert(target);
+    tx_ptr->free_set.insert(target);
     return true;
 }
