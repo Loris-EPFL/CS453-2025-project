@@ -84,9 +84,19 @@ struct Region {
 
 // Map address to lock index using stripe-based locking
 static inline size_t addr_to_lock_index(Region* region, void const* addr) {
-    uintptr_t offset = (uintptr_t)addr - (uintptr_t)region->start;
-    size_t word_index = offset / region->align;
-    return word_index % region->num_locks;
+    // For addresses outside the shared region, use a hash-based approach
+    uintptr_t addr_val = (uintptr_t)addr;
+    uintptr_t region_start = (uintptr_t)region->start;
+    
+    if (addr_val >= region_start && addr_val < region_start + region->size) {
+        // Address within shared region - use offset-based mapping
+        uintptr_t offset = addr_val - region_start;
+        size_t word_index = offset / region->align;
+        return word_index % region->num_locks;
+    } else {
+        // Address outside shared region (dynamically allocated) - use hash
+        return (addr_val / sizeof(void*)) % region->num_locks;
+    }
 }
 
 // Validate read set
@@ -384,23 +394,15 @@ bool tm_write(shared_t shared, tx_t tx_id, void const* source, size_t size, void
     
     size_t lock_idx = addr_to_lock_index(region, target);
     
-    // Check if already in write set
-    for (auto& entry : tx->write_set) {
-        if (entry.addr == target && entry.size == size) {
-            memcpy(entry.data.data(), source, size);
-            return true;
-        }
-    }
-    
-    // Add to write set
+    // Store in write set
     WriteEntry entry;
     entry.addr = target;
     entry.size = size;
-    entry.lock_idx = lock_idx;
     entry.data.resize(size);
     memcpy(entry.data.data(), source, size);
-    tx->write_set.push_back(std::move(entry));
+    entry.lock_idx = lock_idx;
     
+    tx->write_set.push_back(entry);
     return true;
 }
 
