@@ -14,6 +14,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <mutex>
 #include <unordered_set>
 #include <vector>
 #include <tm.hpp>
@@ -55,9 +56,10 @@ struct Transaction {
     bool is_ro;    // IsReadOnly flag
     std::vector<ReadEntry> read_set;  // Only for read-write transactions
     std::map<void*, WriteEntry> write_set;  // Sorted map for deadlock-free locking
-    std::vector<VersionedLock*> acquired_locks;  // Locks held during commit
+    std::unordered_set<VersionedLock*> acquired_locks;  // Use unordered_set for O(1) lookup
     std::unordered_set<void*> alloc_set;
     std::unordered_set<void*> free_set;
+    std::map<void*, size_t> alloc_sizes;  // Track sizes of allocated segments
 };
 
 // Shared memory region
@@ -70,6 +72,7 @@ struct Region {
     size_t num_locks;
     SegmentNode* allocs{nullptr};
     std::atomic<size_t> segment_count{0};  // Track number of allocated segments (max 65536)
+    std::mutex alloc_mutex;                // Protect allocation list and deferred frees
     std::vector<void*> deferred_frees;     // Segments to be freed after all transactions complete
 };
 
@@ -90,6 +93,16 @@ static inline size_t addr_to_lock_index(Region* region, void const* addr) {
 }
 
 shared_t tm_create(size_t size, size_t align) noexcept {
+    // Validate alignment is a power of 2
+    if (align == 0 || (align & (align - 1)) != 0) {
+        return invalid_shared;
+    }
+    
+    // Validate size is a positive multiple of alignment and at most 2^48
+    if (size == 0 || size % align != 0 || size > (1ULL << 48)) {
+        return invalid_shared;
+    }
+    
     Region* region = new Region();
     if (unlikely(!region)) {
         return invalid_shared;
@@ -99,6 +112,9 @@ shared_t tm_create(size_t size, size_t align) noexcept {
         delete region;
         return invalid_shared;
     }
+    
+    // Initialize the first allocated segment with zeroes as per specification
+    memset(region->start, 0, size);
     
     region->size = size;
     region->align = align;
@@ -172,72 +188,63 @@ bool tm_read(shared_t shared, tx_t tx, void const* source, size_t size, void* ta
     
     // Basic safety checks
     if (source == nullptr || target == nullptr || size == 0) {
-        return false; // Abort on null pointers or zero size
+        return false;
     }
     
-
-    
-    // Step 1: Check Write-Set for read-your-own-writes
-    auto it = tx_ptr->write_set.find((void*)source);
+    // Check write-set for read-your-own-writes first
+    auto it = tx_ptr->write_set.find(const_cast<void*>(source));
     if (it != tx_ptr->write_set.end() && it->second.size == size) {
-        // Found exact match in WriteSet
         memcpy(target, it->second.data.data(), size);
         return true;
     }
     
-    // Check for partial overlaps in WriteSet (abort for safety)
-    uintptr_t read_start = (uintptr_t)source;
-    uintptr_t read_end = read_start + size;
-    
-    for (const auto& entry : tx_ptr->write_set) {
-        uintptr_t write_start = (uintptr_t)entry.first;
-        uintptr_t write_end = write_start + entry.second.size;
+    // For read-only transactions, perform simple read with validation
+    if (tx_ptr->is_ro) {
+        size_t lock_index = addr_to_lock_index(region, source);
+        VersionedLock* lock_ptr = &region->locks[lock_index];
         
-        // Check for any overlap
-        if (read_start < write_end && write_start < read_end) {
-            return false; // Abort on partial overlap
-        }
-    }
-    
-    // Step 2: Read from Shared Memory
-    size_t lock_idx = addr_to_lock_index(region, source);
-    VersionedLock* lock_ptr = &region->locks[lock_idx];
-    
-    while (true) {
-        // Atomically load lock value into v1
         uintptr_t v1 = lock_ptr->value.load(std::memory_order_acquire);
-        
-        // Step 3: Pre-Validation Rule
-        // Check if lock bit is set OR version > ReadVersion
         if ((v1 & LOCK_BIT) != 0 || (v1 & VERSION_MASK) > tx_ptr->rv) {
-            return false; // Abort transaction
+            return false;
         }
-        
-        // Step 4: Perform Read
-        // // Check for obviously invalid low addresses (like 0x5e from crash)
-        // // Only catch extremely low addresses that are clearly corrupted
-        // if ((uintptr_t)source < 0x100) {  // 256 bytes threshold for clearly invalid addresses
-        //     return false; // Abort transaction
-        // }
         
         memcpy(target, source, size);
         
-        // Step 5: Post-Validation Rule
-        // Atomically load lock value again into v2
         uintptr_t v2 = lock_ptr->value.load(std::memory_order_acquire);
-        
         if (v1 != v2) {
-            // Concurrent modification occurred, retry
-            continue;
+            return false;
         }
         
-        // Step 6: Record Read (for Read-Write Transactions only)
-        if (!tx_ptr->is_ro) {
-            ReadEntry entry;
-            entry.lock_ptr = lock_ptr;
-            entry.version_observed = v1 & VERSION_MASK;
-            tx_ptr->read_set.push_back(entry);
+        return true;
+    }
+    
+    // For read-write transactions, use full TL2 protocol
+    size_t lock_index = addr_to_lock_index(region, source);
+    VersionedLock* lock_ptr = &region->locks[lock_index];
+    
+    // Retry loop for concurrent modifications
+    while (true) {
+        uintptr_t v1 = lock_ptr->value.load(std::memory_order_acquire);
+        
+        // Pre-validation: check if locked or version too new
+        if ((v1 & LOCK_BIT) != 0 || (v1 & VERSION_MASK) > tx_ptr->rv) {
+            return false;
         }
+        
+        // Copy the data
+        memcpy(target, source, size);
+        
+        // Post-validation: check if lock changed
+        uintptr_t v2 = lock_ptr->value.load(std::memory_order_acquire);
+        if (v1 != v2) {
+            continue; // Retry
+        }
+        
+        // Record read for validation at commit time
+        ReadEntry entry;
+        entry.lock_ptr = lock_ptr;
+        entry.version_observed = v1 & VERSION_MASK;
+        tx_ptr->read_set.push_back(entry);
         
         return true;
     }
@@ -246,8 +253,8 @@ bool tm_read(shared_t shared, tx_t tx, void const* source, size_t size, void* ta
 
 // TransactionalWrite procedure (per TL2 spec)
 bool tm_write(shared_t shared, tx_t tx, void const* source, size_t size, void* target) noexcept {
-    Transaction* tx_ptr = (Transaction*)tx;
     (void)shared; // Suppress unused parameter warning
+    Transaction* tx_ptr = (Transaction*)tx;
     
     // Read-only transactions cannot write
     if (tx_ptr->is_ro) {
@@ -256,7 +263,7 @@ bool tm_write(shared_t shared, tx_t tx, void const* source, size_t size, void* t
     
     // Basic safety checks
     if (source == nullptr || target == nullptr || size == 0) {
-        return false; // Abort on null pointers or zero size
+        return false;
     }
     
     // Store in write set for deferred execution
@@ -272,15 +279,20 @@ bool tm_write(shared_t shared, tx_t tx, void const* source, size_t size, void* t
 
 // ABORT_PROCEDURE helper
 static void abort_transaction(Transaction* tx, Region* region) {
-    (void)region; // Suppress unused parameter warning
-    
-    // Release any acquired locks, leaving version unchanged
+    // Release all acquired locks with their original versions
     for (VersionedLock* lock_ptr : tx->acquired_locks) {
-        uintptr_t current = lock_ptr->value.load(std::memory_order_relaxed);
-        lock_ptr->value.store(current & VERSION_MASK, std::memory_order_release);
+        // Clear lock bit, keep version
+        uintptr_t current = lock_ptr->value.load(std::memory_order_acquire);
+        uintptr_t unlocked = current & VERSION_MASK;
+        lock_ptr->value.store(unlocked, std::memory_order_release);
     }
-    tx->acquired_locks.clear();
-    delete tx;
+    
+    // Clean up allocated segments that were not committed
+    for (void* addr : tx->alloc_set) {
+        SegmentNode* node = (SegmentNode*)((uintptr_t)addr - sizeof(SegmentNode));
+        std::free(node);
+        region->segment_count.fetch_sub(1, std::memory_order_relaxed);
+    }
 }
 
 // TransactionEnd procedure - 5-phase commit protocol (per TL2 spec)
@@ -308,15 +320,10 @@ bool tm_end(shared_t shared, tx_t tx) noexcept {
         size_t lock_idx = addr_to_lock_index(region, entry.first);
         VersionedLock* lock_ptr = &region->locks[lock_idx];
         
-        // Skip if already acquired
-        bool already_acquired = false;
-        for (VersionedLock* acquired : tx_ptr->acquired_locks) {
-            if (acquired == lock_ptr) {
-                already_acquired = true;
-                break;
-            }
+        // Skip if already acquired (O(1) lookup with unordered_set)
+        if (tx_ptr->acquired_locks.count(lock_ptr)) {
+            continue;
         }
-        if (already_acquired) continue;
         
         // Attempt to acquire lock with CAS
         uintptr_t expected = lock_ptr->value.load(std::memory_order_acquire);
@@ -331,7 +338,7 @@ bool tm_end(shared_t shared, tx_t tx) noexcept {
             uintptr_t desired = expected | LOCK_BIT;
             if (lock_ptr->value.compare_exchange_weak(expected, desired, 
                     std::memory_order_acquire, std::memory_order_acquire)) {
-                tx_ptr->acquired_locks.push_back(lock_ptr);
+                tx_ptr->acquired_locks.insert(lock_ptr);
                 break;
             }
         }
@@ -346,13 +353,8 @@ bool tm_end(shared_t shared, tx_t tx) noexcept {
         uintptr_t current = entry.lock_ptr->value.load(std::memory_order_acquire);
         
         // Check if version changed or locked by different transaction
-        bool locked_by_us = false;
-        for (VersionedLock* acquired : tx_ptr->acquired_locks) {
-            if (acquired == entry.lock_ptr) {
-                locked_by_us = true;
-                break;
-            }
-        }
+        // Optimize: O(1) lookup with unordered_set
+        bool locked_by_us = tx_ptr->acquired_locks.count(entry.lock_ptr);
         
         if (!locked_by_us) {
             if ((current & LOCK_BIT) != 0 || (current & VERSION_MASK) != entry.version_observed) {
@@ -369,29 +371,43 @@ bool tm_end(shared_t shared, tx_t tx) noexcept {
     }
     
     // Process allocations
-    for (void* addr : tx_ptr->alloc_set) {
-        SegmentNode* node = (SegmentNode*)((uintptr_t)addr - sizeof(SegmentNode));
-        node->prev = nullptr;
-        node->next = region->allocs;
-        if (region->allocs) region->allocs->prev = node;
-        region->allocs = node;
+    {
+        std::lock_guard<std::mutex> lock(region->alloc_mutex);
+        for (void* addr : tx_ptr->alloc_set) {
+            SegmentNode* node = (SegmentNode*)((uintptr_t)addr - sizeof(SegmentNode));
+            node->prev = nullptr;
+            node->next = region->allocs;
+            if (region->allocs) region->allocs->prev = node;
+            region->allocs = node;
+        }
     }
     
     // Process frees - defer actual freeing to avoid concurrent access issues
-    for (void* addr : tx_ptr->free_set) {
-        SegmentNode* node = (SegmentNode*)((uintptr_t)addr - sizeof(SegmentNode));
+    {
+        std::lock_guard<std::mutex> lock(region->alloc_mutex);
+        for (void* addr : tx_ptr->free_set) {
+            SegmentNode* node = (SegmentNode*)((uintptr_t)addr - sizeof(SegmentNode));
+            
+            // Unlink from allocation list
+            if (node->prev) node->prev->next = node->next;
+            else region->allocs = node->next;
+            if (node->next) node->next->prev = node->prev;
+            
+            // Add to deferred free list instead of freeing immediately
+            region->deferred_frees.push_back(addr);
+        }
         
-        // Unlink from allocation list
-        if (node->prev) node->prev->next = node->next;
-        else region->allocs = node->next;
-        if (node->next) node->next->prev = node->prev;
-        
-        // Add to deferred free list instead of freeing immediately
-        // This prevents concurrent transactions from accessing freed memory
-        region->deferred_frees.push_back(addr);
-        
-        // Decrement segment count
-        region->segment_count.fetch_sub(1, std::memory_order_acq_rel);
+        // Periodic cleanup of deferred frees - only when really necessary
+        if (region->deferred_frees.size() > 1000) {
+            size_t to_free = region->deferred_frees.size() / 4; // Free only 1/4
+            for (size_t i = 0; i < to_free; i++) {
+                void* addr = region->deferred_frees[i];
+                SegmentNode* node = (SegmentNode*)((uintptr_t)addr - sizeof(SegmentNode));
+                free(node);
+            }
+            region->deferred_frees.erase(region->deferred_frees.begin(), 
+                                       region->deferred_frees.begin() + to_free);
+        }
     }
     
     // Step 6: Phase 5 - Release Locks
@@ -445,6 +461,7 @@ Alloc tm_alloc(shared_t shared, tx_t tx, size_t size, void** target) noexcept {
     
     *target = segment;
     tx_ptr->alloc_set.insert(segment);
+    tx_ptr->alloc_sizes[segment] = size;  // Track the size of this segment
     
     // Increment segment count
     region->segment_count.fetch_add(1, std::memory_order_acq_rel);
@@ -463,6 +480,7 @@ bool tm_free(shared_t shared, tx_t tx, void* target) noexcept {
     // Check if allocated in this transaction - if so, remove from alloc set
     if (tx_ptr->alloc_set.count(target)) {
         tx_ptr->alloc_set.erase(target);
+        tx_ptr->alloc_sizes.erase(target);  // Also remove from size tracking
         // Decrement segment count since we're canceling the allocation
         region->segment_count.fetch_sub(1, std::memory_order_acq_rel);
         
@@ -470,6 +488,24 @@ bool tm_free(shared_t shared, tx_t tx, void* target) noexcept {
         SegmentNode* node = (SegmentNode*)((uintptr_t)target - sizeof(SegmentNode));
         free(node);
         return true;
+    }
+    
+    // Validate that the target is actually in our allocation list before freeing
+    {
+        std::lock_guard<std::mutex> lock(region->alloc_mutex);
+        SegmentNode* current = region->allocs;
+        bool found = false;
+        while (current) {
+            void* segment = (void*)((uintptr_t)current + sizeof(SegmentNode));
+            if (segment == target) {
+                found = true;
+                break;
+            }
+            current = current->next;
+        }
+        if (!found) {
+            return false; // Target not found in allocation list
+        }
     }
     
     // Otherwise, defer the free until commit (as per Q&A guidance)
