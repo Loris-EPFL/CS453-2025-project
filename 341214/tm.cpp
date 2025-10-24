@@ -69,6 +69,8 @@ struct Region {
     VersionedLock* locks;
     size_t num_locks;
     SegmentNode* allocs{nullptr};
+    std::atomic<size_t> segment_count{0};  // Track number of allocated segments (max 65536)
+    std::vector<void*> deferred_frees;     // Segments to be freed after all transactions complete
 };
 
 // Map address to lock index using stripe-based locking
@@ -121,6 +123,12 @@ void tm_destroy(shared_t shared) noexcept {
         current = next;
     }
     
+    // Clean up deferred frees - now it's safe since no transactions are running
+    for (void* addr : region->deferred_frees) {
+        SegmentNode* node = (SegmentNode*)((uintptr_t)addr - sizeof(SegmentNode));
+        std::free(node);
+    }
+    
     delete[] region->locks;
     free(region->start);
     delete region;
@@ -157,7 +165,7 @@ tx_t tm_begin(shared_t shared, bool is_ro) noexcept {
     return (tx_t)tx;
 }
 
-// // TransactionalRead procedure (per TL2 spec)
+// TransactionalRead procedure (per TL2 spec)
 bool tm_read(shared_t shared, tx_t tx, void const* source, size_t size, void* target) noexcept {
     Transaction* tx_ptr = (Transaction*)tx;
     Region* region = (Region*)shared;
@@ -167,11 +175,7 @@ bool tm_read(shared_t shared, tx_t tx, void const* source, size_t size, void* ta
         return false; // Abort on null pointers or zero size
     }
     
-    // Check for obviously invalid low addresses (like 0x5e from crash)
-    // Only catch extremely low addresses that are clearly corrupted
-    if ((uintptr_t)source < 0x100) {  // 256 bytes threshold for clearly invalid addresses
-        return false; // Abort transaction
-    }
+
     
     // Step 1: Check Write-Set for read-your-own-writes
     auto it = tx_ptr->write_set.find((void*)source);
@@ -243,7 +247,7 @@ bool tm_read(shared_t shared, tx_t tx, void const* source, size_t size, void* ta
 // TransactionalWrite procedure (per TL2 spec)
 bool tm_write(shared_t shared, tx_t tx, void const* source, size_t size, void* target) noexcept {
     Transaction* tx_ptr = (Transaction*)tx;
-    Region* region = (Region*)shared;
+    (void)shared; // Suppress unused parameter warning
     
     // Read-only transactions cannot write
     if (tx_ptr->is_ro) {
@@ -268,6 +272,8 @@ bool tm_write(shared_t shared, tx_t tx, void const* source, size_t size, void* t
 
 // ABORT_PROCEDURE helper
 static void abort_transaction(Transaction* tx, Region* region) {
+    (void)region; // Suppress unused parameter warning
+    
     // Release any acquired locks, leaving version unchanged
     for (VersionedLock* lock_ptr : tx->acquired_locks) {
         uintptr_t current = lock_ptr->value.load(std::memory_order_relaxed);
@@ -371,7 +377,7 @@ bool tm_end(shared_t shared, tx_t tx) noexcept {
         region->allocs = node;
     }
     
-    // Process frees
+    // Process frees - defer actual freeing to avoid concurrent access issues
     for (void* addr : tx_ptr->free_set) {
         SegmentNode* node = (SegmentNode*)((uintptr_t)addr - sizeof(SegmentNode));
         
@@ -380,7 +386,12 @@ bool tm_end(shared_t shared, tx_t tx) noexcept {
         else region->allocs = node->next;
         if (node->next) node->next->prev = node->prev;
         
-        free(node);
+        // Add to deferred free list instead of freeing immediately
+        // This prevents concurrent transactions from accessing freed memory
+        region->deferred_frees.push_back(addr);
+        
+        // Decrement segment count
+        region->segment_count.fetch_sub(1, std::memory_order_acq_rel);
     }
     
     // Step 6: Phase 5 - Release Locks
@@ -400,7 +411,24 @@ Alloc tm_alloc(shared_t shared, tx_t tx, size_t size, void** target) noexcept {
     Transaction* tx_ptr = (Transaction*)tx;
     Region* region = (Region*)shared;
     
+    // Size alignment validation as per specification
     size_t align = region->align;
+    
+    // Check size alignment - must be a positive multiple of alignment
+    if (size == 0 || size % align != 0) {
+        return Alloc::nomem; // Return nomem for invalid size
+    }
+    
+    // Check size limit (2^48 bytes)
+    if (size > (1ULL << 48)) {
+        return Alloc::nomem; // Return nomem for size too large
+    }
+    
+    // Check segment limit (max 65536 segments as per Q&A)
+    if (region->segment_count.load(std::memory_order_acquire) >= 65536) {
+        return Alloc::nomem; // Return nomem if segment limit reached
+    }
+    
     if (align < sizeof(void*)) {
         align = sizeof(void*);
     }
@@ -411,10 +439,15 @@ Alloc tm_alloc(shared_t shared, tx_t tx, size_t size, void** target) noexcept {
     }
     
     void* segment = (void*)((uintptr_t)node + sizeof(SegmentNode));
+    
+    // Ensure allocated segment is initialized with zeroes as per specification
     memset(segment, 0, size);
     
     *target = segment;
     tx_ptr->alloc_set.insert(segment);
+    
+    // Increment segment count
+    region->segment_count.fetch_add(1, std::memory_order_acq_rel);
     
     return Alloc::success;
 }
@@ -423,16 +456,23 @@ bool tm_free(shared_t shared, tx_t tx, void* target) noexcept {
     Transaction* tx_ptr = (Transaction*)tx;
     Region* region = (Region*)shared;
     
-    // Check if allocated in this transaction
+    if (target == nullptr) {
+        return false;
+    }
+    
+    // Check if allocated in this transaction - if so, remove from alloc set
     if (tx_ptr->alloc_set.count(target)) {
-        // Remove from alloc set and free immediately
         tx_ptr->alloc_set.erase(target);
+        // Decrement segment count since we're canceling the allocation
+        region->segment_count.fetch_sub(1, std::memory_order_acq_rel);
+        
+        // Free immediately since it was never committed
         SegmentNode* node = (SegmentNode*)((uintptr_t)target - sizeof(SegmentNode));
         free(node);
         return true;
     }
     
-    // Defer free until commit
+    // Otherwise, defer the free until commit (as per Q&A guidance)
     tx_ptr->free_set.insert(target);
     return true;
 }
