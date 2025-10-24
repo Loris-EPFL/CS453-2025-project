@@ -157,10 +157,21 @@ tx_t tm_begin(shared_t shared, bool is_ro) noexcept {
     return (tx_t)tx;
 }
 
-// TransactionalRead procedure (per TL2 spec)
+// // TransactionalRead procedure (per TL2 spec)
 bool tm_read(shared_t shared, tx_t tx, void const* source, size_t size, void* target) noexcept {
     Transaction* tx_ptr = (Transaction*)tx;
     Region* region = (Region*)shared;
+    
+    // Basic safety checks
+    if (source == nullptr || target == nullptr || size == 0) {
+        return false; // Abort on null pointers or zero size
+    }
+    
+    // Check for obviously invalid low addresses (like 0x5e from crash)
+    // Only catch extremely low addresses that are clearly corrupted
+    if ((uintptr_t)source < 0x100) {  // 256 bytes threshold for clearly invalid addresses
+        return false; // Abort transaction
+    }
     
     // Step 1: Check Write-Set for read-your-own-writes
     auto it = tx_ptr->write_set.find((void*)source);
@@ -199,6 +210,12 @@ bool tm_read(shared_t shared, tx_t tx, void const* source, size_t size, void* ta
         }
         
         // Step 4: Perform Read
+        // // Check for obviously invalid low addresses (like 0x5e from crash)
+        // // Only catch extremely low addresses that are clearly corrupted
+        // if ((uintptr_t)source < 0x100) {  // 256 bytes threshold for clearly invalid addresses
+        //     return false; // Abort transaction
+        // }
+        
         memcpy(target, source, size);
         
         // Step 5: Post-Validation Rule
@@ -222,6 +239,7 @@ bool tm_read(shared_t shared, tx_t tx, void const* source, size_t size, void* ta
     }
 }
 
+
 // TransactionalWrite procedure (per TL2 spec)
 bool tm_write(shared_t shared, tx_t tx, void const* source, size_t size, void* target) noexcept {
     Transaction* tx_ptr = (Transaction*)tx;
@@ -230,6 +248,11 @@ bool tm_write(shared_t shared, tx_t tx, void const* source, size_t size, void* t
     // Read-only transactions cannot write
     if (tx_ptr->is_ro) {
         return false;
+    }
+    
+    // Basic safety checks
+    if (source == nullptr || target == nullptr || size == 0) {
+        return false; // Abort on null pointers or zero size
     }
     
     // Store in write set for deferred execution
