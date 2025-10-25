@@ -222,8 +222,11 @@ bool tm_read(shared_t shared, tx_t tx, void const* source, size_t size, void* ta
     size_t lock_index = addr_to_lock_index(region, source);
     VersionedLock* lock_ptr = &region->locks[lock_index];
     
-    // Retry loop for concurrent modifications
-    while (true) {
+    // Retry loop for concurrent modifications with limit to prevent infinite loops
+    const int MAX_RETRIES = 100;
+    int retry_count = 0;
+    
+    while (retry_count < MAX_RETRIES) {
         uintptr_t v1 = lock_ptr->value.load(std::memory_order_acquire);
         
         // Pre-validation: check if locked or version too new
@@ -237,6 +240,7 @@ bool tm_read(shared_t shared, tx_t tx, void const* source, size_t size, void* ta
         // Post-validation: check if lock changed
         uintptr_t v2 = lock_ptr->value.load(std::memory_order_acquire);
         if (v1 != v2) {
+            retry_count++;
             continue; // Retry
         }
         
@@ -248,6 +252,9 @@ bool tm_read(shared_t shared, tx_t tx, void const* source, size_t size, void* ta
         
         return true;
     }
+    
+    // If we've exceeded retry limit, abort the transaction
+    return false;
 }
 
 
@@ -327,7 +334,10 @@ bool tm_end(shared_t shared, tx_t tx) noexcept {
         
         // Attempt to acquire lock with CAS
         uintptr_t expected = lock_ptr->value.load(std::memory_order_acquire);
-        while (true) {
+        const int MAX_LOCK_RETRIES = 1000;
+        int lock_retry_count = 0;
+        
+        while (lock_retry_count < MAX_LOCK_RETRIES) {
             // Check if locked or version too new
             if ((expected & LOCK_BIT) != 0 || (expected & VERSION_MASK) > tx_ptr->rv) {
                 abort_transaction(tx_ptr, region);
@@ -341,6 +351,14 @@ bool tm_end(shared_t shared, tx_t tx) noexcept {
                 tx_ptr->acquired_locks.insert(lock_ptr);
                 break;
             }
+            
+            lock_retry_count++;
+        }
+        
+        // If we couldn't acquire the lock after many retries, abort
+        if (lock_retry_count >= MAX_LOCK_RETRIES) {
+            abort_transaction(tx_ptr, region);
+            return false;
         }
     }
     
