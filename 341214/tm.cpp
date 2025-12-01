@@ -15,6 +15,7 @@
 #include <cstring>
 #include <map>
 #include <mutex>
+#include <thread>
 #include <unordered_set>
 #include <vector>
 #include <tm.hpp>
@@ -120,9 +121,9 @@ shared_t tm_create(size_t size, size_t align) noexcept {
     region->align = align;
     region->allocs = nullptr;
     
-    // Create lock table (stripe-based)
-    size_t desired_locks = std::min(size / 1024, (size_t)(1UL << 16));
-    region->num_locks = std::max(desired_locks, (size_t)256);
+    // Create lock table (stripe-based) - increased size to reduce false conflicts
+    size_t desired_locks = std::min(size / 256, (size_t)(1UL << 16));
+    region->num_locks = std::max(desired_locks, (size_t)1024);
     region->locks = new VersionedLock[region->num_locks]();
     
     return region;
@@ -332,13 +333,14 @@ bool tm_end(shared_t shared, tx_t tx) noexcept {
             continue;
         }
         
-        // Attempt to acquire lock with CAS
-        uintptr_t expected = lock_ptr->value.load(std::memory_order_acquire);
-        const int MAX_LOCK_RETRIES = 1000;
-        int lock_retry_count = 0;
+        // Attempt to acquire lock with limited retries and exponential backoff
+        const int MAX_CAS_ATTEMPTS = 15;  // Increased to reduce abort storms
+        int cas_attempts = 0;
         
-        while (lock_retry_count < MAX_LOCK_RETRIES) {
-            // Check if locked or version too new
+        while (cas_attempts < MAX_CAS_ATTEMPTS) {
+            uintptr_t expected = lock_ptr->value.load(std::memory_order_acquire);
+            
+            // Check if locked or version too new - ABORT IMMEDIATELY
             if ((expected & LOCK_BIT) != 0 || (expected & VERSION_MASK) > tx_ptr->rv) {
                 abort_transaction(tx_ptr, region);
                 return false;
@@ -352,11 +354,18 @@ bool tm_end(shared_t shared, tx_t tx) noexcept {
                 break;
             }
             
-            lock_retry_count++;
+            // CAS failed - add exponential backoff to reduce contention
+            cas_attempts++;
+            if (cas_attempts < MAX_CAS_ATTEMPTS) {
+                // Exponential backoff: 1, 2, 4, 8, 16 yields (capped at 16)
+                for (int i = 0; i < (1 << std::min(cas_attempts - 1, 4)); i++) {
+                    std::this_thread::yield();
+                }
+            }
         }
         
-        // If we couldn't acquire the lock after many retries, abort
-        if (lock_retry_count >= MAX_LOCK_RETRIES) {
+        // If we exhausted CAS attempts, abort
+        if (cas_attempts >= MAX_CAS_ATTEMPTS) {
             abort_transaction(tx_ptr, region);
             return false;
         }
