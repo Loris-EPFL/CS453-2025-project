@@ -501,9 +501,9 @@ Write operation in the transaction, source in a private region and target in the
     @return true: the transaction can continue, false: the transaction has aborted
     @note   - This function can be called concurrently, but concurrent calls must be made with at least a different shared parameter or a different tx parameter.
             - The private buffer source can only be dereferenced for the duration of the call.
-            - The length size must be a positive multiple of the shared memory region's alignment, otherwise the behavior is undened.
-            - The length of the buffers source and target must be at least size, otherwise the behavior is undened.
-            - The source and target addresses must be a positive multiple of the shared memory region's alignment, otherwise the behavior is undened.
+            - The length size must be a positive multiple of the shared memory region's alignment, otherwise the behavior is undefined.
+            - The length of the buffers source and target must be at least size, otherwise the behavior is undefined.
+            - The source and target addresses must be a positive multiple of the shared memory region's alignment, otherwise the behavior is undefined.
 */
 bool tm_write(shared_t shared, tx_t tx, void const* source, size_t size, void* target) noexcept {
     (void)shared;
