@@ -1,34 +1,32 @@
 /**
  * @file   tm.cpp
- * @author TL2 Implementation
+ * @author Loris Tran
  *
  * @section DESCRIPTION
  *
- * Transactional Locking II (TL2) implementation for CS453 project.
- * This implementation strictly follows the TL2 algorithm specification
+ * Transactional Locking II (TL2) implementation for the CS453 project.
+ * This implementation follows the TL2 algorithm specification
  * with proper global version clock, versioned locks, and 5-phase commit.
 **/
 
-#include <algorithm>
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
 #include <map>
 #include <mutex>
-#include <thread>
 #include <unordered_set>
 #include <vector>
 #include <tm.hpp>
 
 #include "macros.h"
 
-// TL2 Constants - using MSB as lock bit
+// Lock bit is MSB, version is everything else
 static constexpr uintptr_t LOCK_BIT = 1UL << 63;
 static constexpr uintptr_t VERSION_MASK = ~LOCK_BIT;
 
 // Versioned lock structure (per TL2 spec)
 struct VersionedLock {
-    std::atomic<uintptr_t> value{2}; // Initialize to even number (version 2)
+    std::atomic<uintptr_t> value{2};  // starts at version 2
 };
 
 // Read set entry (Lock_Pointer, Version_Observed)
@@ -44,27 +42,28 @@ struct WriteEntry {
     std::vector<uint8_t> data;
 };
 
-// Allocated segment metadata
+// Linked list node for tracking allocated segments
 struct SegmentNode {
     SegmentNode* prev;
     SegmentNode* next;
 };
 
-// Transaction descriptor (per TL2 spec)
+// Transaction structure for TL2
 struct Transaction {
-    uintptr_t rv;  // ReadVersion - snapshot from GVClock
-    uintptr_t wv;  // WriteVersion - assigned at commit time
+    uintptr_t rv;  // ReadVersion snapshot from Global Versionning Clock
+    uintptr_t wv;  // WriteVersion assigned at commit time
     bool is_ro;    // IsReadOnly flag
     std::vector<ReadEntry> read_set;  // Only for read-write transactions
     std::map<void*, WriteEntry> write_set;  // Sorted map for deadlock-free locking
     std::unordered_set<VersionedLock*> acquired_locks;  // Use unordered_set for O(1) lookup
-    std::unordered_set<void*> alloc_set;
-    std::unordered_set<void*> free_set;
+    std::unordered_set<void*> alloc_set; // Allocation Set
+    std::unordered_set<void*> free_set; // Free Set
     std::map<void*, size_t> alloc_sizes;  // Track sizes of allocated segments
     
+
+    //Util function to clean up a whole transaction statet (put everything to 0, clear all sets)
     void reset() {
-        rv = 0;
-        wv = 0;
+        rv = wv = 0;
         is_ro = false;
         read_set.clear();
         for (auto& entry : write_set) {
@@ -94,7 +93,7 @@ struct Region {
     std::mutex alloc_mutex;                // Protect allocation list
 };
 
-// Map address to lock index using stripe-based locking
+// Maps an address to its corresponding lock index
 static inline size_t addr_to_lock_index(Region* region, void const* addr) {
     uintptr_t addr_val = (uintptr_t)addr;
     uintptr_t region_start = (uintptr_t)region->start;
@@ -150,7 +149,7 @@ shared_t tm_create(size_t size, size_t align) noexcept {
 void tm_destroy(shared_t shared) noexcept {
     Region* region = (Region*)shared;
     
-    // Clean up allocated segments
+    // free all allocated segments
     SegmentNode* current = region->allocs;
     while (current) {
         SegmentNode* next = current->next;
@@ -224,11 +223,7 @@ bool tm_read(shared_t shared, tx_t tx, void const* source, size_t size, void* ta
         memcpy(target, source, size);
         
         uintptr_t v2 = lock_ptr->value.load(std::memory_order_acquire);
-        if (v1 != v2) {
-            return false;
-        }
-        
-        return true;
+        return (v1 == v2); // If both versions match, return true because no changes occured while reading, else false
     }
     
     // For read-write transactions, use full TL2 protocol
@@ -263,7 +258,7 @@ bool tm_read(shared_t shared, tx_t tx, void const* source, size_t size, void* ta
 
 // TransactionalWrite procedure (per TL2 spec)
 bool tm_write(shared_t shared, tx_t tx, void const* source, size_t size, void* target) noexcept {
-    (void)shared; // Suppress unused parameter warning
+    (void)shared;
     Transaction* tx_ptr = (Transaction*)tx;
     
     // Read-only transactions cannot write
@@ -284,6 +279,7 @@ bool tm_write(shared_t shared, tx_t tx, void const* source, size_t size, void* t
     memcpy(entry.data.data(), source, size);
     
     tx_ptr->write_set[target] = std::move(entry);
+    
     return true;
 }
 
@@ -293,8 +289,7 @@ static void abort_transaction(Transaction* tx, Region* region) {
     for (VersionedLock* lock_ptr : tx->acquired_locks) {
         // Clear lock bit, keep version
         uintptr_t current = lock_ptr->value.load(std::memory_order_acquire);
-        uintptr_t unlocked = current & VERSION_MASK;
-        lock_ptr->value.store(unlocked, std::memory_order_release);
+        lock_ptr->value.store(current & VERSION_MASK, std::memory_order_release);
     }
     
     // Clean up allocated segments that were not committed
