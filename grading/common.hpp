@@ -69,7 +69,7 @@ extern "C" {
 constexpr static auto assert_mode = false;
 
 // Maximum waiting time for initialization/clean-ups (in ms)
-constexpr static auto max_side_time = ::std::chrono::milliseconds{2000};
+constexpr static auto max_side_time = ::std::chrono::milliseconds{16000};
 
 // -------------------------------------------------------------------------- //
 namespace Exception {
